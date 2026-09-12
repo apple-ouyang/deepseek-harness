@@ -270,7 +270,13 @@ export function apply(ctx: Context, config: AcpConfig): void {
         // The attached log writer's flush materializes an empty session durably.
         await ctx.sessions.flush(record.agent.session)
         assertOpen()
-        await publishAvailableCommands(sessionId, record.agent.session.header.cwd)
+        const newCwd = record.agent.session.header.cwd
+        queueMicrotask(() => {
+          void publishAvailableCommands(sessionId, newCwd)
+        })
+        setTimeout(() => {
+          void publishAvailableCommands(sessionId, newCwd)
+        }, 50)
         return { sessionId, configOptions }
       } catch (error: unknown) {
         sessions.delete(sessionId)
@@ -324,7 +330,13 @@ export function apply(ctx: Context, config: AcpConfig): void {
         sessions.set(sessionId, record)
         try {
           const configOptions = await record.configOptions(signal)
-          await publishAvailableCommands(sessionId, record.agent.session.header.cwd)
+          const resumeCwd = record.agent.session.header.cwd
+          queueMicrotask(() => {
+            void publishAvailableCommands(sessionId, resumeCwd)
+          })
+          setTimeout(() => {
+            void publishAvailableCommands(sessionId, resumeCwd)
+          }, 50)
           return { configOptions }
         } catch (error: unknown) {
           sessions.delete(sessionId)
@@ -348,6 +360,9 @@ export function apply(ctx: Context, config: AcpConfig): void {
         queueMicrotask(() => {
           void publishAvailableCommands(sessionId, cwd)
         })
+        setTimeout(() => {
+          void publishAvailableCommands(sessionId, cwd)
+        }, 50)
       }
       return result
     },
