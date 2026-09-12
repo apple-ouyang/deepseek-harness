@@ -17,7 +17,8 @@ import { AcpContentError, admitAcpPrompt } from './content.ts'
 import { turnEndToStopReason } from './codec.ts'
 import { mountAcpMcpServers } from './mcp.ts'
 import { AcpModelControl } from './model-control.ts'
-import { assistantUpdates, toolCallUpdate, toolResultUpdate } from './updates.ts'
+import type {} from '@deepseek-ai/dsh-session-persistence'
+import { assistantUpdates, toolCallUpdate, toolResultUpdate, userMessageUpdates } from './updates.ts'
 
 /** The continuable-subagent teardown used without depending on the subagent package. */
 interface ContinuableDrain {
@@ -385,6 +386,41 @@ export class AcpSession {
         inflight.endReason = event.data.reason
       }
       if (event.type === 'turn/end') this.modelControl.releaseTurn(event.data.turn)
+    }
+  }
+
+  /**
+   * Replay the durable JSONL as ACP `session/update` notifications so clients
+   * can paint history. `session/resume` must not call this (ACP resume is no-replay).
+   */
+  async replayFromPersistence(
+    notify: (notification: SessionNotification) => Promise<void>,
+  ): Promise<void> {
+    const sessionId = this.agent.session.id
+    const handle = await this.ctx.sessionPersistence.open(sessionId, 'read')
+    try {
+      const { events } = await handle.read(0)
+      for (const event of events) {
+        try {
+          if (event.type === 'user/message') {
+            for (const update of await userMessageUpdates(this.ctx, event)) {
+              await notify({ sessionId, update })
+            }
+          } else if (event.type === 'assistant/message') {
+            for (const update of await assistantUpdates(this.ctx, this.agent.session, event)) {
+              await notify({ sessionId, update })
+            }
+          } else if (event.type === 'tool/call') {
+            await notify({ sessionId, update: toolCallUpdate(event) })
+          } else if (event.type === 'tool/result') {
+            await notify({ sessionId, update: await toolResultUpdate(this.ctx, event) })
+          }
+        } catch (error: unknown) {
+          this.ctx.logger.warn(`acp: history replay skipped ${event.type}: ${errorChain(error)}`)
+        }
+      }
+    } finally {
+      await handle.close()
     }
   }
 

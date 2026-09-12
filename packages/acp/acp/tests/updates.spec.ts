@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 import type { Context } from '@deepseek-ai/cordis'
 import { ToolCallId, MessageId } from '@deepseek-ai/dsh-llm'
 import { SessionSeq, type Session, type SessionEvent } from '@deepseek-ai/dsh-session'
-import { assistantUpdates, toolCallUpdate, toolResultUpdate } from '../src/updates.ts'
+import { assistantUpdates, toolCallUpdate, toolResultUpdate, userMessageUpdates } from '../src/updates.ts'
 
 /** Minimal committed assistant event for pure update projection tests. */
 function assistantEvent(
@@ -92,5 +92,43 @@ describe('standard ACP update projection', () => {
       status: 'failed',
       content: [],
     })
+  })
+
+  it('projects human user text and skips plugin injects', async () => {
+    const ctx = { get: () => undefined } as unknown as Context
+    const human: SessionEvent<'user/message'> = {
+      type: 'user/message',
+      surfaceOp: 'append',
+      seq: SessionSeq(0),
+      time: 0,
+      data: {
+        id: MessageId('user-1'),
+        role: 'user',
+        source: { kind: 'user' },
+        content: [
+          { type: 'text', text: 'hello' },
+          { type: 'text', text: '' },
+        ],
+      },
+    }
+    const injected: SessionEvent<'user/message'> = {
+      type: 'user/message',
+      surfaceOp: 'append',
+      seq: SessionSeq(1),
+      time: 0,
+      data: {
+        id: MessageId('user-plugin'),
+        role: 'user',
+        source: { kind: 'plugin', plugin: 'dsh-skill' },
+        content: [{ type: 'text', text: 'AGENTS.md' }],
+      },
+    }
+
+    await expect(userMessageUpdates(ctx, human)).resolves.toEqual([{
+      sessionUpdate: 'user_message_chunk',
+      messageId: 'user-1',
+      content: { type: 'text', text: 'hello' },
+    }])
+    await expect(userMessageUpdates(ctx, injected)).resolves.toEqual([])
   })
 })
