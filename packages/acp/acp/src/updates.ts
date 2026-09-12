@@ -109,3 +109,41 @@ function parseToolArguments(value: string): unknown {
     return value
   }
 }
+
+/**
+ * Replay a committed user prompt as ACP `user_message_chunk` updates.
+ * Plugin-injected context stays off the client transcript.
+ */
+export async function userMessageUpdates(
+  ctx: Context,
+  event: SessionEvent<'user/message'>,
+): Promise<SessionUpdate[]> {
+  const message = event.data
+  if (message.source.kind !== 'user') return []
+  const updates: SessionUpdate[] = []
+  for (const block of message.content) {
+    if (block.type === 'text' && block.text.length > 0) {
+      updates.push({
+        sessionUpdate: 'user_message_chunk',
+        messageId: message.id,
+        content: { type: 'text', text: block.text },
+      })
+      continue
+    }
+    if (block.type === 'image') {
+      try {
+        const content = await assistantBlockToAcp(ctx, block)
+        if (content !== undefined) {
+          updates.push({
+            sessionUpdate: 'user_message_chunk',
+            messageId: message.id,
+            content,
+          })
+        }
+      } catch (_image) {
+        /* skip unrestorable attachments rather than failing the whole replay */
+      }
+    }
+  }
+  return updates
+}

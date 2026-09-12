@@ -33,6 +33,8 @@ import {
   type InitializeResponse,
   type ListSessionsRequest,
   type ListSessionsResponse,
+  type LoadSessionRequest,
+  type LoadSessionResponse,
   type NewSessionRequest,
   type NewSessionResponse,
   type PromptRequest,
@@ -181,6 +183,7 @@ export function apply(ctx: Context, config: AcpConfig): void {
         protocolVersion: PROTOCOL_VERSION,
         agentInfo: { name: 'deepseek-harness-acp', version: '0.0.1' },
         agentCapabilities: {
+          loadSession: true,
           mcpCapabilities: { http: true },
           promptCapabilities: { image: imagePromptEnabled, audio: false, embeddedContext: false },
           sessionCapabilities: { close: {}, list: {}, resume: {} },
@@ -289,6 +292,19 @@ export function apply(ctx: Context, config: AcpConfig): void {
       })().finally(() => { activating.delete(sessionId) })
     },
 
+    async loadSession(params: LoadSessionRequest, signal: AbortSignal): Promise<LoadSessionResponse> {
+      const result = await implementation.resumeSession(params, signal)
+      const record = sessions.get(brandString<SessionId>(params.sessionId))
+      if (record !== undefined) {
+        try {
+          await record.replayFromPersistence(notify)
+        } catch (error: unknown) {
+          logger.warn(`acp: session/load history replay failed: ${errorChain(error)}`)
+        }
+      }
+      return result
+    },
+
     async listSessions(params: ListSessionsRequest, signal: AbortSignal): Promise<ListSessionsResponse> {
       assertOpen()
       if (params.cwd !== undefined && params.cwd !== null && !isAbsolute(params.cwd)) {
@@ -382,6 +398,7 @@ export function apply(ctx: Context, config: AcpConfig): void {
       return {}
     })
     .onRequest(methods.agent.session.new, ({ params, signal }) => implementation.newSession(params, signal))
+    .onRequest(methods.agent.session.load, ({ params, signal }) => implementation.loadSession(params, signal))
     .onRequest(methods.agent.session.list, ({ params, signal }) => implementation.listSessions(params, signal))
     .onRequest(methods.agent.session.resume, ({ params, signal }) => implementation.resumeSession(params, signal))
     .onRequest(methods.agent.session.close, ({ params }) => implementation.closeSession(params))
