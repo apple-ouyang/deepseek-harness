@@ -134,10 +134,45 @@ export function apply(ctx: Context, config: AcpConfig): void {
     /* v8 ignore stop */
   }
 
+  /**
+   * Publish user-invocable skills as ACP slash commands. Skills are optional on
+   * this plugin's inject list so a missing registry must not take the bridge down.
+   */
+  const publishAvailableCommands = async (sessionId: SessionId, cwd: string | undefined): Promise<void> => {
+    type SkillCatalog = {
+      list: (options?: { cwd?: string }) => Promise<Array<{
+        name: string
+        description: string
+        invocation?: { userInvocable?: boolean }
+      }>>
+    }
+    let availableCommands: Array<{ name: string; description: string }> = []
+    try {
+      const skills = (ctx as Context & { get(name: string): SkillCatalog | undefined }).get('skills')
+      const listed = await skills?.list({ cwd }) ?? []
+      availableCommands = listed
+        .filter(skill => skill.invocation?.userInvocable !== false)
+        .map(skill => ({ name: skill.name, description: skill.description }))
+    } catch (error: unknown) {
+      logger.warn(`acp: skill catalog for commands failed: ${errorChain(error)}`)
+    }
+    await notify({
+      sessionId,
+      update: { sessionUpdate: 'available_commands_update', availableCommands },
+    })
+  }
+
   ctx.on('session/event', (session, event) => {
     const record = sessions.get(session.header.id)
     if (record?.ownsSession(session) === true) record.onSessionEvent(session, event)
   })
+
+  ;(ctx as Context & { on(event: 'skills/change', listener: () => void): void })
+    .on('skills/change', () => {
+      for (const record of sessions.values()) {
+        void publishAvailableCommands(record.agent.session.id, record.agent.session.header.cwd)
+      }
+    })
 
   ctx.on('agent/inbox/claimed', ({ agent, message, turn }) => {
     ownedRecord(agent)?.onInboxClaimed(message, turn)
@@ -231,6 +266,7 @@ export function apply(ctx: Context, config: AcpConfig): void {
         // The attached log writer's flush materializes an empty session durably.
         await ctx.sessions.flush(record.agent.session)
         assertOpen()
+        await publishAvailableCommands(sessionId, record.agent.session.header.cwd)
         return { sessionId, configOptions }
       } catch (error: unknown) {
         sessions.delete(sessionId)
@@ -283,7 +319,9 @@ export function apply(ctx: Context, config: AcpConfig): void {
         }
         sessions.set(sessionId, record)
         try {
-          return { configOptions: await record.configOptions(signal) }
+          const configOptions = await record.configOptions(signal)
+          await publishAvailableCommands(sessionId, record.agent.session.header.cwd)
+          return { configOptions }
         } catch (error: unknown) {
           sessions.delete(sessionId)
           await record.close('session/resume option discovery failed')
@@ -301,6 +339,11 @@ export function apply(ctx: Context, config: AcpConfig): void {
         } catch (error: unknown) {
           logger.warn(`acp: session/load history replay failed: ${errorChain(error)}`)
         }
+        const cwd = record.agent.session.header.cwd
+        const sessionId = record.agent.session.id
+        queueMicrotask(() => {
+          void publishAvailableCommands(sessionId, cwd)
+        })
       }
       return result
     },
