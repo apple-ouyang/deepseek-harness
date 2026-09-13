@@ -146,13 +146,25 @@ export function apply(ctx: Context, config: AcpConfig): void {
         invocation?: { userInvocable?: boolean }
       }>>
     }
-    let availableCommands: Array<{ name: string; description: string }> = []
+    // ACP has no first-class command kind. Every published entry here is a
+    // user-invocable skill, so tag it in the reserved `_meta` bag: clients such
+    // as Paseo use the tag to offer skills inline in a prompt, not just at its
+    // start (an untagged command is treated as executable and hidden mid-prompt).
+    let availableCommands: Array<{
+      name: string
+      description: string
+      _meta: { kind: 'skill' }
+    }> = []
     try {
       const skills = (ctx as Context & { get(name: string): SkillCatalog | undefined }).get('skills')
       const listed = await skills?.list({ cwd }) ?? []
       availableCommands = listed
         .filter(skill => skill.invocation?.userInvocable !== false)
-        .map(skill => ({ name: skill.name, description: skill.description }))
+        .map(skill => ({
+          name: skill.name,
+          description: skill.description,
+          _meta: { kind: 'skill' },
+        }))
     } catch (error: unknown) {
       logger.warn(`acp: skill catalog for commands failed: ${errorChain(error)}`)
     }
