@@ -56,6 +56,13 @@ function classifyPiAiError(message: string): string {
   // finish_reason`). The connection dropped mid-response, so this is a transport
   // truncation, not a model-level error.
   if (/stream ended (?:before|without)\b/i.test(message)) return 'TRANSPORT'
+  // A connection that dropped without a provider-specific truncation wording:
+  // Node's HTTP client reports a response body cut short as `unexpected EOF`.
+  if (/\bunexpected EOF\b/i.test(message)) return 'TRANSPORT'
+  // A TLS record failure on the wire (Go's stack renders it as
+  // `remote error: tls: bad record MAC`) is a corrupted transport, not a
+  // model-level error, so it retries like the drop wordings below.
+  if (/\bbad record MAC\b|remote error:\s*tls:/i.test(message)) return 'TRANSPORT'
   if (/\b(?:network|connection|socket|fetch)\b|\bECONN[A-Z]+\b/i.test(message)
     || /\b(?:other side closed|HTTP2 request did not get a response|WebSocket closed unexpectedly)\b/i.test(message)
     // undici renders a mid-stream socket drop as a bare `terminated` (its
