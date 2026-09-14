@@ -18,6 +18,7 @@ import { turnEndToStopReason } from './codec.ts'
 import { mountAcpMcpServers } from './mcp.ts'
 import { AcpModelControl } from './model-control.ts'
 import type {} from '@deepseek-ai/dsh-session-persistence'
+import { AcpSubagentTracker, SUBAGENT_UPDATE_METHOD } from './subagents.ts'
 import { assistantUpdates, toolCallUpdate, toolResultUpdate, userMessageUpdates } from './updates.ts'
 
 /** The continuable-subagent teardown used without depending on the subagent package. */
@@ -34,6 +35,8 @@ interface AcpSessionBuildOptions {
   fallbackSelection: ModelSelection | undefined
   signal: AbortSignal
   notify: (notification: SessionNotification) => Promise<void>
+  /** Send one out-of-band extension notification to the client (provider subagents). */
+  extNotify: (method: string, params: Record<string, unknown>) => Promise<void>
 }
 
 /** Fresh ACP session construction inputs. */
@@ -104,12 +107,14 @@ export class AcpSession {
   private inflight: InflightPrompt | undefined
   private closing: Promise<void> | undefined
   private readonly pendingSelections = new Map<string, ModelSelection>()
+  private readonly subagentTracker = new AcpSubagentTracker()
 
   private constructor(
     private readonly ctx: Context,
     handle: AgentHandle,
     modelControl: AcpModelControl,
     private readonly notify: (notification: SessionNotification) => Promise<void>,
+    private readonly extNotify: (method: string, params: Record<string, unknown>) => Promise<void>,
   ) {
     this.agent = handle.agent
     this.modelControl = modelControl
@@ -136,7 +141,7 @@ export class AcpSession {
         await mountAcpMcpServers(agentCtx, options.mcpServers, options.cwd)
       },
     })
-    return new AcpSession(ctx, handle, modelControl, options.notify)
+    return new AcpSession(ctx, handle, modelControl, options.notify, options.extNotify)
   }
 
   /**
@@ -166,7 +171,7 @@ export class AcpSession {
       throw internalError('session/resume did not compose model selection')
     }
     /* v8 ignore stop */
-    return new AcpSession(ctx, handle, modelControl, options.notify)
+    return new AcpSession(ctx, handle, modelControl, options.notify, options.extNotify)
   }
 
   /**
@@ -387,6 +392,38 @@ export class AcpSession {
       }
       if (event.type === 'turn/end') this.modelControl.releaseTurn(event.data.turn)
     }
+  }
+
+  /**
+   * Project one descendant session's committed event onto the client's
+   * provider-subagent surface. Delivery rides the same ordered tail as this
+   * session's standard updates, so a client never observes a reordered batch.
+   * @param session - descendant session owning the event.
+   * @param event - committed durable event from that descendant.
+   */
+  onDescendantEvent(session: Session, event: SessionEvent): void {
+    let events: ReturnType<AcpSubagentTracker['observe']>
+    try {
+      events = this.subagentTracker.observe(session, event)
+    /* v8 ignore start -- a projection bug must not disturb the unrelated root session. */
+    } catch (error: unknown) {
+      this.ctx.logger.warn(`acp: subagent projection failed: ${errorChain(error)}`)
+      return
+    }
+    /* v8 ignore stop */
+    if (events.length === 0) return
+    const previous = this.outputTail
+    this.outputTail = previous
+      .then(() => this.extNotify(SUBAGENT_UPDATE_METHOD, {
+        sessionId: this.agent.session.id,
+        provider: 'dsh',
+        events,
+      }))
+      /* v8 ignore start -- the bridge notifier already contains transport rejection. */
+      .catch((error: unknown) => {
+        this.ctx.logger.warn(`acp: subagent update delivery failed: ${errorChain(error)}`)
+      })
+    /* v8 ignore stop */
   }
 
   /**

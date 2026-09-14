@@ -48,7 +48,7 @@ import {
   type Stream,
 } from '@agentclientprotocol/sdk'
 import type { ModelSelection } from '@deepseek-ai/dsh-agent'
-import type { SessionId } from '@deepseek-ai/dsh-session'
+import type { Session, SessionId } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-session-persistence'
 // Side-effect type import: declaration-merges the approval waterfall answered below.
 import type {} from '@deepseek-ai/dsh-user-approval'
@@ -134,6 +134,17 @@ export function apply(ctx: Context, config: AcpConfig): void {
     /* v8 ignore stop */
   }
 
+  /** Send one out-of-band extension notification the standard surface omits. */
+  const extNotify = async (method: string, params: Record<string, unknown>): Promise<void> => {
+    try {
+      await conn.notify(method, params)
+    /* v8 ignore start -- the ACP SDK contains transport-only notification failure. */
+    } catch (error: unknown) {
+      logger.warn(`acp: extension notification ${method} failed: ${String(error)}`)
+    }
+    /* v8 ignore stop */
+  }
+
   /**
    * Publish user-invocable skills as ACP slash commands. Skills are optional on
    * this plugin's inject list so a missing registry must not take the bridge down.
@@ -174,9 +185,31 @@ export function apply(ctx: Context, config: AcpConfig): void {
     })
   }
 
+  /**
+   * Resolve the bridge-owned root whose descendant tree contains this session.
+   * In-process delegation records its direct parent on every child header, so
+   * walking that chain finds the published root without the subagent service.
+   */
+  const descendantRecord = (session: Session): AcpSession | undefined => {
+    if (sessions.size === 0) return undefined
+    const seen = new Set<SessionId>()
+    let parent = session.header.parentSession
+    while (parent !== undefined && !seen.has(parent)) {
+      seen.add(parent)
+      const record = sessions.get(parent)
+      if (record !== undefined) return record
+      parent = ctx.sessions.get(parent)?.header.parentSession
+    }
+    return undefined
+  }
+
   ctx.on('session/event', (session, event) => {
     const record = sessions.get(session.header.id)
-    if (record?.ownsSession(session) === true) record.onSessionEvent(session, event)
+    if (record?.ownsSession(session) === true) {
+      record.onSessionEvent(session, event)
+      return
+    }
+    descendantRecord(session)?.onDescendantEvent(session, event)
   })
 
   ;(ctx as Context & { on(event: 'skills/change', listener: () => void): void })
@@ -261,6 +294,7 @@ export function apply(ctx: Context, config: AcpConfig): void {
           fallbackSelection: initialSelection(config),
           signal,
           notify,
+          extNotify,
         })
       } catch (error: unknown) {
         if (error instanceof AcpMcpConfigError) throw invalidParams(error.message)
@@ -319,6 +353,7 @@ export function apply(ctx: Context, config: AcpConfig): void {
             fallbackSelection: initialSelection(config),
             signal,
             notify,
+            extNotify,
           })
         } catch (error: unknown) {
           if (error instanceof AcpMcpConfigError) throw invalidParams(error.message)
