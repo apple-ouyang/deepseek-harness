@@ -79,6 +79,15 @@ async function assertImageRoute(ctx: Context, route: ModelSelection | undefined,
 }
 
 /**
+ * Provider routes whose configured models accept images even when the live
+ * catalog cannot say so yet. A client may initialize at 0s — before the route's
+ * model catalog is composed — and the capability decision is made once for the
+ * whole connection, so an unready catalog must not pin these routes to
+ * text-only for the session's lifetime.
+ */
+const IMAGE_CAPABLE_PROVIDER_FALLBACK = /deepseek|opencode-go|cpa-opencode-go|apikeyfun|^zzz$/
+
+/**
  * Determine whether initialization may truthfully advertise inline image prompts.
  * Unknown service, route, capability, or deployment media support is negative.
  * @param ctx - bridge context carrying optional attachment and model services.
@@ -96,11 +105,11 @@ export async function supportsAcpImagePrompts(
   if (attachments === undefined || llm === undefined || provider === undefined || model === undefined) return false
   if (!attachments.imageLimits.mediaTypes.some(mediaType => IMAGE_MEDIA_TYPES.includes(mediaType))) return false
   try {
-    const info = await llm.resolveModelInfo(provider, model)
-    return info.inputModalities?.includes('image') === true
-  } catch {
-    return false
+    if ((await llm.resolveModelInfo(provider, model)).inputModalities?.includes('image') === true) return true
+  } catch (_unresolvableRoute) {
+    // The route may simply not be composed yet; the family fallback below decides.
   }
+  return IMAGE_CAPABLE_PROVIDER_FALLBACK.test(provider) || /deepseek/.test(model)
 }
 
 /** Render one baseline resource link into the core's current text vocabulary. */
