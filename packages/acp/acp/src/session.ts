@@ -3,6 +3,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import {
   RequestError,
+  type ContentBlock as AcpContentBlock,
   type McpServer,
   type PromptRequest,
   type PromptResponse,
@@ -73,6 +74,74 @@ function invalidParams(detail: string): RequestError {
 /** Standard internal failure with protocol-safe detail. */
 function internalError(detail: string): RequestError {
   return RequestError.internalError(undefined, detail)
+}
+
+/**
+ * The native command-registry surface this bridge consumes.
+ *
+ * The registry is an optional mount on the ACP profile (a human-command owner
+ * shared with the harness's own UI adapters), so the bridge reads it through
+ * `Context.get` and narrows it structurally instead of hard-depending on its
+ * package.
+ */
+interface CommandRuntimeView {
+  /** Resolve one effective command definition for this agent, if any. */
+  find(agent: Agent, name: string): unknown
+  /**
+   * Parse and execute one known command without sending it to the model.
+   * @param agent - exact receiving agent.
+   * @param line - complete slash-command line.
+   * @param attachments - wire attachments accompanying the line; the bridge sends none.
+   * @param signal - cancellation signal owned by the ACP request.
+   * @returns the settled execution, or `undefined` for a syntactically invalid or unknown line.
+   */
+  execute(
+    agent: Agent,
+    line: string,
+    attachments: readonly unknown[],
+    signal: AbortSignal,
+  ): Promise<CommandExecutionView | undefined>
+}
+
+/** One settled native command execution narrowed to the fields the bridge projects. */
+interface CommandExecutionView {
+  /** Pairing id minted for this execution's log-only lifecycle events. */
+  readonly commandId: string
+  /** The handler's normalized human-facing outcome. */
+  readonly result: { readonly kind: 'success' | 'error'; readonly text?: string }
+}
+
+/**
+ * Split one candidate native slash-command line.
+ *
+ * Mirrors `@deepseek-ai/dsh-commands`' own `parseCommand` grammar exactly: the
+ * bridge treats the registry as optional, so it must not import that package.
+ * @param line - complete candidate command line.
+ * @returns the lowercase command name and its verbatim trailing input, or `undefined`.
+ */
+function parseCommandLine(line: string): { name: string; rawInput: string } | undefined {
+  const match = /^\/([a-z][a-z0-9_-]*)(?=$|[\t\n\r ])/u.exec(line)
+  if (match === null) return undefined
+  const name = match[1]
+  /* v8 ignore next -- the first capture is required whenever the regular expression matches */
+  if (name === undefined) return undefined
+  return { name, rawInput: line.slice(match[0].length) }
+}
+
+/**
+ * Return the literal command line when a prompt is exactly one text block.
+ *
+ * A native command is a whole submission, never one inline token among other
+ * content, so a mixed or multi-block prompt always stays model-facing.
+ * @param prompt - the ACP prompt's ordered content blocks.
+ * @returns the trimmed line when it starts with a slash, otherwise `undefined`.
+ */
+function commandLine(prompt: readonly AcpContentBlock[]): string | undefined {
+  if (prompt.length !== 1) return undefined
+  const block = prompt[0]
+  if (block === undefined || block.type !== 'text') return undefined
+  const line = block.text.trim()
+  return line.startsWith('/') ? line : undefined
 }
 
 /** Restore the latest logged route before falling back to deployment config. */
@@ -253,6 +322,17 @@ export class AcpSession {
   ): Promise<PromptResponse> {
     this.assertActive()
     if (this.inflight !== undefined) throw invalidParams('a prompt is already in flight for this session')
+    // ACP carries no command-invocation method, so a native command can only
+    // arrive as prompt text. Resolve it here, before admission, so a registered
+    // command never reaches the model as user prose.
+    const line = commandLine(params.prompt)
+    if (line !== undefined) {
+      const parsed = parseCommandLine(line)
+      const runtime = (this.ctx as Context & { get(name: string): CommandRuntimeView | undefined }).get('commands')
+      if (parsed !== undefined && runtime?.find(this.agent, parsed.name) !== undefined) {
+        return this.runCommand(line, requestSignal)
+      }
+    }
     const completion = Promise.withResolvers<StopReason>()
     const admission = Promise.withResolvers<void>()
     const admissionController = new AbortController()
@@ -331,6 +411,49 @@ export class AcpSession {
 
       this.settleAfterQuiescence(inflight)
       return { stopReason: await completion.promise }
+    } finally {
+      requestSignal?.removeEventListener('abort', onRequestAbort)
+    }
+  }
+
+  /**
+   * Execute one registered native command the bridge resolved from a prompt
+   * line, then project its outcome as one assistant message.
+   *
+   * A command never opens a model turn, so this settles immediately instead of
+   * waiting for `turn/end`; the registry still records its own `command/run` and
+   * `command/done` lifecycle events, which stay off the client transcript.
+   * @param line - complete slash-command line, already resolved as registered.
+   * @param requestSignal - JSON-RPC request cancellation signal.
+   * @returns the standard stop reason once the outcome update is delivered.
+   */
+  async runCommand(line: string, requestSignal?: AbortSignal): Promise<PromptResponse> {
+    this.assertActive()
+    const runtime = (this.ctx as Context & { get(name: string): CommandRuntimeView | undefined }).get('commands')
+    if (runtime === undefined) throw internalError('commands service is not mounted')
+    const controller = new AbortController()
+    const onRequestAbort = (): void => { controller.abort() }
+    requestSignal?.addEventListener('abort', onRequestAbort, { once: true })
+    if (requestSignal?.aborted === true) onRequestAbort()
+    try {
+      const execution = await runtime.execute(this.agent, line, [], controller.signal)
+      /* v8 ignore next 2 -- the caller resolved this exact name against the same registry. */
+      if (execution === undefined) throw invalidParams(`unknown command: ${line}`)
+      const text = execution.result.text
+      await this.notify({
+        sessionId: this.agent.session.id,
+        update: {
+          sessionUpdate: 'agent_message_chunk',
+          messageId: `command-${execution.commandId}`,
+          content: {
+            type: 'text',
+            text: text === undefined || text.length === 0
+              ? execution.result.kind === 'success' ? 'Command completed.' : 'Command failed.'
+              : text,
+          },
+        },
+      })
+      return { stopReason: 'end_turn' }
     } finally {
       requestSignal?.removeEventListener('abort', onRequestAbort)
     }

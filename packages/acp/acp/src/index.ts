@@ -47,7 +47,7 @@ import {
   type SessionNotification,
   type Stream,
 } from '@agentclientprotocol/sdk'
-import type { ModelSelection } from '@deepseek-ai/dsh-agent'
+import type { Agent, ModelSelection } from '@deepseek-ai/dsh-agent'
 import type { Session, SessionId } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-session-persistence'
 // Side-effect type import: declaration-merges the approval waterfall answered below.
@@ -146,10 +146,17 @@ export function apply(ctx: Context, config: AcpConfig): void {
   }
 
   /**
-   * Publish user-invocable skills as ACP slash commands. Skills are optional on
-   * this plugin's inject list so a missing registry must not take the bridge down.
+   * Publish the session's user-invocable skills and its registered native
+   * commands as ACP slash commands. Both catalogs are optional mounts on this
+   * profile, so a missing registry must not take the bridge down.
+   *
+   * ACP has no first-class command kind. Every entry therefore carries its kind
+   * in the reserved `_meta` bag: clients such as Paseo offer skills inline in a
+   * prompt while keeping an executable command at the prompt's start only.
    */
-  const publishAvailableCommands = async (sessionId: SessionId, cwd: string | undefined): Promise<void> => {
+  const publishAvailableCommands = async (record: AcpSession): Promise<void> => {
+    const sessionId = record.agent.session.id
+    const cwd = record.agent.session.header.cwd
     type SkillCatalog = {
       list: (options?: { cwd?: string }) => Promise<Array<{
         name: string
@@ -157,25 +164,49 @@ export function apply(ctx: Context, config: AcpConfig): void {
         invocation?: { userInvocable?: boolean }
       }>>
     }
-    // ACP has no first-class command kind. Every published entry here is a
-    // user-invocable skill, so tag it in the reserved `_meta` bag: clients such
-    // as Paseo use the tag to offer skills inline in a prompt, not just at its
-    // start (an untagged command is treated as executable and hidden mid-prompt).
-    let availableCommands: Array<{
+    // Native commands are the harness's own slash commands (`/compact`,
+    // `/goal`, …). `session/prompt` carries no invocation method, so the bridge
+    // both advertises them here and resolves them back out of the prompt line.
+    type CommandCatalog = {
+      list: (agent: Agent) => ReadonlyArray<{
+        name: string
+        description: string
+        input?: { hint: string }
+      }>
+    }
+    const availableCommands: Array<{
       name: string
       description: string
-      _meta: { kind: 'skill' }
+      input?: { hint: string }
+      _meta: { kind: 'command' | 'skill' }
     }> = []
+    try {
+      const commands = (ctx as Context & { get(name: string): CommandCatalog | undefined }).get('commands')
+      for (const command of commands?.list(record.agent) ?? []) {
+        availableCommands.push({
+          name: command.name,
+          description: command.description,
+          ...command.input === undefined ? {} : { input: { hint: command.input.hint } },
+          _meta: { kind: 'command' },
+        })
+      }
+    } catch (error: unknown) {
+      logger.warn(`acp: command registry for commands failed: ${errorChain(error)}`)
+    }
     try {
       const skills = (ctx as Context & { get(name: string): SkillCatalog | undefined }).get('skills')
       const listed = await skills?.list({ cwd }) ?? []
-      availableCommands = listed
-        .filter(skill => skill.invocation?.userInvocable !== false)
-        .map(skill => ({
+      for (const skill of listed) {
+        if (skill.invocation?.userInvocable === false) continue
+        // A native command owns its name: the bridge executes it locally, so
+        // publishing a same-named skill would advertise an entry it never runs.
+        if (availableCommands.some(entry => entry.name === skill.name)) continue
+        availableCommands.push({
           name: skill.name,
           description: skill.description,
           _meta: { kind: 'skill' },
-        }))
+        })
+      }
     } catch (error: unknown) {
       logger.warn(`acp: skill catalog for commands failed: ${errorChain(error)}`)
     }
@@ -215,7 +246,16 @@ export function apply(ctx: Context, config: AcpConfig): void {
   ;(ctx as Context & { on(event: 'skills/change', listener: () => void): void })
     .on('skills/change', () => {
       for (const record of sessions.values()) {
-        void publishAvailableCommands(record.agent.session.id, record.agent.session.header.cwd)
+        void publishAvailableCommands(record)
+      }
+    })
+
+  // The native command registry is a separate owner from the skill catalog and
+  // announces its own mutations, so the published list has to follow both.
+  ;(ctx as Context & { on(event: 'commands/change', listener: () => void): void })
+    .on('commands/change', () => {
+      for (const record of sessions.values()) {
+        void publishAvailableCommands(record)
       }
     })
 
@@ -312,12 +352,11 @@ export function apply(ctx: Context, config: AcpConfig): void {
         // The attached log writer's flush materializes an empty session durably.
         await ctx.sessions.flush(record.agent.session)
         assertOpen()
-        const newCwd = record.agent.session.header.cwd
         queueMicrotask(() => {
-          void publishAvailableCommands(sessionId, newCwd)
+          void publishAvailableCommands(record)
         })
         setTimeout(() => {
-          void publishAvailableCommands(sessionId, newCwd)
+          void publishAvailableCommands(record)
         }, 50)
         return { sessionId, configOptions }
       } catch (error: unknown) {
@@ -373,12 +412,11 @@ export function apply(ctx: Context, config: AcpConfig): void {
         sessions.set(sessionId, record)
         try {
           const configOptions = await record.configOptions(signal)
-          const resumeCwd = record.agent.session.header.cwd
           queueMicrotask(() => {
-            void publishAvailableCommands(sessionId, resumeCwd)
+            void publishAvailableCommands(record)
           })
           setTimeout(() => {
-            void publishAvailableCommands(sessionId, resumeCwd)
+            void publishAvailableCommands(record)
           }, 50)
           return { configOptions }
         } catch (error: unknown) {
@@ -398,13 +436,11 @@ export function apply(ctx: Context, config: AcpConfig): void {
         } catch (error: unknown) {
           logger.warn(`acp: session/load history replay failed: ${errorChain(error)}`)
         }
-        const cwd = record.agent.session.header.cwd
-        const sessionId = record.agent.session.id
         queueMicrotask(() => {
-          void publishAvailableCommands(sessionId, cwd)
+          void publishAvailableCommands(record)
         })
         setTimeout(() => {
-          void publishAvailableCommands(sessionId, cwd)
+          void publishAvailableCommands(record)
         }, 50)
       }
       return result
