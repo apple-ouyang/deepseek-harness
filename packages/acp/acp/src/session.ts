@@ -10,6 +10,7 @@ import {
   type SessionConfigOption,
   type SessionNotification,
   type StopReason,
+  type ToolCallContent,
 } from '@agentclientprotocol/sdk'
 import type { Agent, AgentHandle, AgentOptions, ModelSelection } from '@deepseek-ai/dsh-agent'
 import { createUserMessage, errorChain, type UserMessage } from '@deepseek-ai/dsh-llm'
@@ -177,6 +178,8 @@ export class AcpSession {
   private closing: Promise<void> | undefined
   private readonly pendingSelections = new Map<string, ModelSelection>()
   private readonly subagentTracker = new AcpSubagentTracker()
+  /** Call-time diff previews keyed by callId, consumed by the matching result. */
+  private readonly pendingToolDiffs = new Map<string, ToolCallContent[]>()
 
   private constructor(
     private readonly ctx: Context,
@@ -487,20 +490,26 @@ export class AcpSession {
           this.ctx.logger.warn(`acp: assistant output conversion failed: ${errorChain(error)}`)
         })
       } else if (event.type === 'tool/call') {
+        const update = toolCallUpdate(event)
+        if (update.sessionUpdate === 'tool_call' && update.content !== undefined && update.content.length > 0) {
+          this.pendingToolDiffs.set(update.toolCallId, update.content)
+        }
         const previous = this.outputTail
         this.outputTail = previous
-          .then(() => this.notify({ sessionId: this.agent.session.id, update: toolCallUpdate(event) }))
+          .then(() => this.notify({ sessionId: this.agent.session.id, update }))
           /* v8 ignore start -- the bridge notifier contains transport rejection. */
           .catch((error: unknown) => {
             this.ctx.logger.warn(`acp: tool-call update delivery failed: ${errorChain(error)}`)
           })
         /* v8 ignore stop */
       } else if (event.type === 'tool/result') {
+        const fallbackContent = this.pendingToolDiffs.get(event.data.message.toolCallId)
+        this.pendingToolDiffs.delete(event.data.message.toolCallId)
         const previous = this.outputTail
         this.outputTail = previous
           .then(async () => this.notify({
             sessionId: this.agent.session.id,
-            update: await toolResultUpdate(this.ctx, event),
+            update: await toolResultUpdate(this.ctx, event, fallbackContent),
           }))
           /* v8 ignore start -- supplemental-content conversion failure is contained and cannot fail Agent work. */
           .catch((error: unknown) => {
@@ -560,6 +569,7 @@ export class AcpSession {
     const handle = await this.ctx.sessionPersistence.open(sessionId, 'read')
     try {
       const { events } = await handle.read(0)
+      const pendingToolDiffs = new Map<string, ToolCallContent[]>()
       for (const event of events) {
         try {
           if (event.type === 'user/message') {
@@ -571,9 +581,16 @@ export class AcpSession {
               await notify({ sessionId, update })
             }
           } else if (event.type === 'tool/call') {
-            await notify({ sessionId, update: toolCallUpdate(event) })
+            const update = toolCallUpdate(event)
+            if (update.sessionUpdate === 'tool_call' && update.content !== undefined && update.content.length > 0) {
+              pendingToolDiffs.set(update.toolCallId, update.content)
+            }
+            await notify({ sessionId, update })
           } else if (event.type === 'tool/result') {
-            await notify({ sessionId, update: await toolResultUpdate(this.ctx, event) })
+            const callId = event.data.message.toolCallId
+            const fallbackContent = pendingToolDiffs.get(callId)
+            pendingToolDiffs.delete(callId)
+            await notify({ sessionId, update: await toolResultUpdate(this.ctx, event, fallbackContent) })
           }
         } catch (error: unknown) {
           this.ctx.logger.warn(`acp: history replay skipped ${event.type}: ${errorChain(error)}`)
