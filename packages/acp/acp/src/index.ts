@@ -48,7 +48,7 @@ import {
   type Stream,
 } from '@agentclientprotocol/sdk'
 import type { Agent, ModelSelection } from '@deepseek-ai/dsh-agent'
-import type { Session, SessionId } from '@deepseek-ai/dsh-session'
+import { buildForkSeed, SessionLogOffset, type Session, type SessionEvent, type SessionId } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-session-persistence'
 // Side-effect type import: declaration-merges the approval waterfall answered below.
 import type {} from '@deepseek-ai/dsh-user-approval'
@@ -303,6 +303,7 @@ export function apply(ctx: Context, config: AcpConfig): void {
         protocolVersion: PROTOCOL_VERSION,
         agentInfo: { name: 'deepseek-harness-acp', version: '0.0.1' },
         agentCapabilities: {
+          _meta: { conversationRewind: { method: '_paseo/session/revert', target: 'user-message-id' } },
           loadSession: true,
           mcpCapabilities: { http: true },
           promptCapabilities: { image: imagePromptEnabled, audio: false, embeddedContext: false },
@@ -515,6 +516,39 @@ export function apply(ctx: Context, config: AcpConfig): void {
       return {}
     },
 
+    /** Fork an ACP conversation immediately before a stable user message id. */
+    async rewindConversation(params: { sessionId: string; messageId: string }): Promise<{ sessionId: string }> {
+      assertOpen()
+      const sourceId = brandString<SessionId>(params.sessionId)
+      const source = requireSession(sourceId)
+      const events = source.agent.session.snapshotEvents()
+      const target = events.find(event => event.type === 'user/message' && event.data.message.id === params.messageId)
+      if (target === undefined) throw invalidParams(`unknown user message: ${params.messageId}`)
+      const boundary = target.seq - 1
+      const seed = boundary < 0 ? [] : buildForkSeed(events, boundary)
+      const sessionId = brandString<SessionId>(randomUUID())
+      const child = await AcpSession.create(ctx, {
+        sessionId,
+        cwd: source.agent.session.header.cwd ?? process.cwd(),
+        mcpServers: [],
+        agentOptions: agentOptions(config),
+        fallbackSelection: initialSelection(config),
+        signal: new AbortController().signal,
+        notify,
+        extNotify,
+        seed,
+        inheritedEventCount: SessionLogOffset(boundary < 0 ? 0 : boundary + 1),
+        meta: {
+          cwd: source.agent.session.header.cwd,
+          parentSession: sourceId,
+          isSeeded: true,
+        },
+      })
+      sessions.set(sessionId, child)
+      await ctx.sessions.flush(child.agent.session)
+      return { sessionId }
+    },
+
     async prompt(params: PromptRequest, requestSignal: AbortSignal): Promise<PromptResponse> {
       assertOpen()
       const record = requireSession(brandString<SessionId>(params.sessionId))
@@ -545,6 +579,7 @@ export function apply(ctx: Context, config: AcpConfig): void {
     .onRequest(methods.agent.session.close, ({ params }) => implementation.closeSession(params))
     .onRequest(methods.agent.session.setConfigOption, ({ params, signal }) => implementation.setSessionConfigOption(params, signal))
     .onRequest(methods.agent.session.prompt, ({ params, signal }) => implementation.prompt(params, signal))
+    .onRequest('_paseo/session/revert', ({ params }) => implementation.rewindConversation(params))
     .onNotification(methods.agent.session.cancel, ({ params }) => implementation.cancel(params))
   const connection = app.connect(stream)
   const conn: AgentContext = connection.client

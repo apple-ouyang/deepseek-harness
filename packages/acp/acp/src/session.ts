@@ -14,7 +14,7 @@ import {
 } from '@agentclientprotocol/sdk'
 import type { Agent, AgentHandle, AgentOptions, ModelSelection } from '@deepseek-ai/dsh-agent'
 import { createUserMessage, errorChain, type UserMessage } from '@deepseek-ai/dsh-llm'
-import { type Session, type SessionEvent, type SessionId, type TurnEndReason } from '@deepseek-ai/dsh-session'
+import { type Session, type SessionEvent, type SessionId, type SessionLogOffset, type TurnEndReason } from '@deepseek-ai/dsh-session'
 import { AcpContentError, admitAcpPrompt } from './content.ts'
 import { turnEndToStopReason } from './codec.ts'
 import { mountAcpMcpServers } from './mcp.ts'
@@ -44,6 +44,12 @@ interface AcpSessionBuildOptions {
 /** Fresh ACP session construction inputs. */
 export interface CreateAcpSessionOptions extends AcpSessionBuildOptions {
   sessionId: SessionId
+  /** Optional replay seed used by conversation rewind forks. */
+  seed?: readonly SessionEvent[]
+  /** Number of source events inherited by a replay seed. */
+  inheritedEventCount?: SessionLogOffset
+  /** Durable lineage metadata for a replay fork. */
+  meta?: { cwd?: string; parentSession?: SessionId; isSeeded?: boolean }
 }
 
 /** Persisted ACP session construction inputs. */
@@ -205,7 +211,9 @@ export class AcpSession {
     const modelControl = new AcpModelControl(ctx.llm, options.fallbackSelection)
     const handle = await ctx.agents.create({
       sessionId: options.sessionId,
-      meta: { cwd: options.cwd },
+      meta: options.meta ?? { cwd: options.cwd },
+      ...options.inheritedEventCount === undefined ? {} : { inheritedEventCount: options.inheritedEventCount },
+      ...options.seed === undefined ? {} : { seed: options.seed },
       agentOptions: options.agentOptions,
       signal: options.signal,
       setup: async (agentCtx) => {
