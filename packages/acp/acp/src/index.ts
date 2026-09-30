@@ -48,7 +48,7 @@ import {
   type Stream,
 } from '@agentclientprotocol/sdk'
 import type { Agent, ModelSelection } from '@deepseek-ai/dsh-agent'
-import { buildForkSeed, SessionLogOffset, type Session, type SessionEvent, type SessionId } from '@deepseek-ai/dsh-session'
+import { buildForkSeed, SessionLogOffset, SessionSeq, type Session, type SessionId } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-session-persistence'
 // Side-effect type import: declaration-merges the approval waterfall answered below.
 import type {} from '@deepseek-ai/dsh-user-approval'
@@ -522,10 +522,10 @@ export function apply(ctx: Context, config: AcpConfig): void {
       const sourceId = brandString<SessionId>(params.sessionId)
       const source = requireSession(sourceId)
       const events = source.agent.session.snapshotEvents()
-      const target = events.find(event => event.type === 'user/message' && event.data.message.id === params.messageId)
+      const target = events.find(event => event.type === 'user/message' && event.data.id === params.messageId)
       if (target === undefined) throw invalidParams(`unknown user message: ${params.messageId}`)
       const boundary = target.seq - 1
-      const seed = boundary < 0 ? [] : buildForkSeed(events, boundary)
+      const seed = boundary < 0 ? [] : buildForkSeed(events, SessionSeq(boundary))
       const sessionId = brandString<SessionId>(randomUUID())
       const child = await AcpSession.create(ctx, {
         sessionId,
@@ -539,7 +539,7 @@ export function apply(ctx: Context, config: AcpConfig): void {
         seed,
         inheritedEventCount: SessionLogOffset(boundary < 0 ? 0 : boundary + 1),
         meta: {
-          cwd: source.agent.session.header.cwd,
+          ...(source.agent.session.header.cwd === undefined ? {} : { cwd: source.agent.session.header.cwd }),
           parentSession: sourceId,
           isSeeded: true,
         },
@@ -579,7 +579,11 @@ export function apply(ctx: Context, config: AcpConfig): void {
     .onRequest(methods.agent.session.close, ({ params }) => implementation.closeSession(params))
     .onRequest(methods.agent.session.setConfigOption, ({ params, signal }) => implementation.setSessionConfigOption(params, signal))
     .onRequest(methods.agent.session.prompt, ({ params, signal }) => implementation.prompt(params, signal))
-    .onRequest('_paseo/session/revert', ({ params }) => implementation.rewindConversation(params))
+    .onRequest(
+      '_paseo/session/revert' as never,
+      (({ params }: { params: { sessionId: string; messageId: string } }) =>
+        implementation.rewindConversation(params)) as never,
+    )
     .onNotification(methods.agent.session.cancel, ({ params }) => implementation.cancel(params))
   const connection = app.connect(stream)
   const conn: AgentContext = connection.client
