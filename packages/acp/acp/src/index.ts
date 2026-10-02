@@ -48,7 +48,7 @@ import {
   type Stream,
 } from '@agentclientprotocol/sdk'
 import type { Agent, ModelSelection } from '@deepseek-ai/dsh-agent'
-import { buildForkSeed, SessionLogOffset, type Session, type SessionEvent, type SessionId } from '@deepseek-ai/dsh-session'
+import { buildForkSeed, SessionLogOffset, SessionSeq, type Session, type SessionId } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-session-persistence'
 // Side-effect type import: declaration-merges the approval waterfall answered below.
 import type {} from '@deepseek-ai/dsh-user-approval'
@@ -58,6 +58,32 @@ import { AcpModelConfigError } from './model-control.ts'
 import { AcpSession } from './session.ts'
 
 const DEFAULT_SESSION_LIST_PAGE_SIZE = 100
+
+/**
+ * Namespaced ACP extension method that forks one session before a user message.
+ * The capability advertisement below and the handler registration share it.
+ */
+const CONVERSATION_REWIND_METHOD = '_paseo/session/revert'
+
+/** Rewind target namespace advertised with {@link CONVERSATION_REWIND_METHOD}. */
+const CONVERSATION_REWIND_TARGET = 'user-message-id'
+
+/** Parsed params of one conversation-rewind request. */
+interface ConversationRewindParams {
+  /** Live ACP session that owns the message being rewound to. */
+  sessionId: string
+  /** Durable user-message id, or the client prompt id that named it. */
+  messageId: string
+}
+
+/** Admit one raw conversation-rewind request's params. */
+function parseConversationRewindParams(params: unknown): ConversationRewindParams {
+  const raw = params as { sessionId?: unknown; messageId?: unknown } | null | undefined
+  if (typeof raw?.sessionId !== 'string' || typeof raw.messageId !== 'string') {
+    throw invalidParams('conversation rewind requires sessionId and messageId')
+  }
+  return { sessionId: raw.sessionId, messageId: raw.messageId }
+}
 
 export const name = 'acp'
 /** Core services required by the standard automation controls. */
@@ -303,7 +329,12 @@ export function apply(ctx: Context, config: AcpConfig): void {
         protocolVersion: PROTOCOL_VERSION,
         agentInfo: { name: 'deepseek-harness-acp', version: '0.0.1' },
         agentCapabilities: {
-          _meta: { conversationRewind: { method: '_paseo/session/revert', target: 'user-message-id' } },
+          _meta: {
+            conversationRewind: {
+              method: CONVERSATION_REWIND_METHOD,
+              target: CONVERSATION_REWIND_TARGET,
+            },
+          },
           loadSession: true,
           mcpCapabilities: { http: true },
           promptCapabilities: { image: imagePromptEnabled, audio: false, embeddedContext: false },
@@ -429,7 +460,13 @@ export function apply(ctx: Context, config: AcpConfig): void {
     },
 
     async loadSession(params: LoadSessionRequest, signal: AbortSignal): Promise<LoadSessionResponse> {
-      const result = await implementation.resumeSession(params, signal)
+      // A session this bridge already owns needs no resume: clients replay a
+      // live fork created by the conversation-rewind extension through the same
+      // history-replay path `session/load` already implements.
+      const active = sessions.get(brandString<SessionId>(params.sessionId))
+      const result = active === undefined
+        ? await implementation.resumeSession(params, signal)
+        : { configOptions: await active.configOptions(signal) }
       const record = sessions.get(brandString<SessionId>(params.sessionId))
       if (record !== undefined) {
         try {
@@ -516,16 +553,23 @@ export function apply(ctx: Context, config: AcpConfig): void {
       return {}
     },
 
-    /** Fork an ACP conversation immediately before a stable user message id. */
-    async rewindConversation(params: { sessionId: string; messageId: string }): Promise<{ sessionId: string }> {
+    /**
+     * Fork an ACP conversation immediately before a stable user message id.
+     *
+     * The client names the message either by the durable id it was replayed
+     * (or never saw changed) or by the `messageId` it sent on `session/prompt`;
+     * the latter is resolved through this session's admission map.
+     */
+    async rewindConversation(params: ConversationRewindParams): Promise<{ sessionId: string }> {
       assertOpen()
       const sourceId = brandString<SessionId>(params.sessionId)
       const source = requireSession(sourceId)
       const events = source.agent.session.snapshotEvents()
-      const target = events.find(event => event.type === 'user/message' && event.data.message.id === params.messageId)
+      const nativeMessageId = source.resolveUserMessageId(params.messageId)
+      const target = events.find(event => event.type === 'user/message' && event.data.id === nativeMessageId)
       if (target === undefined) throw invalidParams(`unknown user message: ${params.messageId}`)
       const boundary = target.seq - 1
-      const seed = boundary < 0 ? [] : buildForkSeed(events, boundary)
+      const seed = boundary < 0 ? [] : buildForkSeed(events, SessionSeq(boundary))
       const sessionId = brandString<SessionId>(randomUUID())
       const child = await AcpSession.create(ctx, {
         sessionId,
@@ -538,9 +582,11 @@ export function apply(ctx: Context, config: AcpConfig): void {
         extNotify,
         seed,
         inheritedEventCount: SessionLogOffset(boundary < 0 ? 0 : boundary + 1),
+        // The fork is an ordinary resumable ACP session: it carries no parent
+        // lineage, so `session/list` filtering and descendant routing treat it
+        // exactly like the session it replaces.
         meta: {
           cwd: source.agent.session.header.cwd,
-          parentSession: sourceId,
           isSeeded: true,
         },
       })
@@ -579,7 +625,11 @@ export function apply(ctx: Context, config: AcpConfig): void {
     .onRequest(methods.agent.session.close, ({ params }) => implementation.closeSession(params))
     .onRequest(methods.agent.session.setConfigOption, ({ params, signal }) => implementation.setSessionConfigOption(params, signal))
     .onRequest(methods.agent.session.prompt, ({ params, signal }) => implementation.prompt(params, signal))
-    .onRequest('_paseo/session/revert', ({ params }) => implementation.rewindConversation(params))
+    .onRequest(
+      CONVERSATION_REWIND_METHOD,
+      parseConversationRewindParams,
+      ({ params }) => implementation.rewindConversation(params),
+    )
     .onNotification(methods.agent.session.cancel, ({ params }) => implementation.cancel(params))
   const connection = app.connect(stream)
   const conn: AgentContext = connection.client

@@ -183,6 +183,8 @@ export class AcpSession {
   private inflight: InflightPrompt | undefined
   private closing: Promise<void> | undefined
   private readonly pendingSelections = new Map<string, ModelSelection>()
+  /** Client prompt ids admitted here, mapped to the durable user-message id. */
+  private readonly promptMessageIds = new Map<string, string>()
   private readonly subagentTracker = new AcpSubagentTracker()
   /** Call-time diff previews keyed by callId, consumed by the matching result. */
   private readonly pendingToolDiffs = new Map<string, ToolCallContent[]>()
@@ -333,6 +335,13 @@ export class AcpSession {
   ): Promise<PromptResponse> {
     this.assertActive()
     if (this.inflight !== undefined) throw invalidParams('a prompt is already in flight for this session')
+    // Remember the client's own prompt id so a later conversation-rewind request
+    // can name this durable user message without guessing the generated id. The
+    // id travels in `_meta` because ACP v1's `PromptRequest` has no `messageId`.
+    const rawClientMessageId = params._meta?.['clientMessageId']
+    const clientMessageId = typeof rawClientMessageId === 'string' && rawClientMessageId.length > 0
+      ? rawClientMessageId
+      : undefined
     // ACP carries no command-invocation method, so a native command can only
     // arrive as prompt text. Resolve it here, before admission, so a registered
     // command never reaches the model as user prose.
@@ -391,6 +400,7 @@ export class AcpSession {
         })
         inflight.messageId = message.id
         inflight.messageQueued = true
+        if (clientMessageId !== undefined) this.promptMessageIds.set(clientMessageId, message.id)
         if (promptSelection !== undefined) this.pendingSelections.set(message.id, promptSelection)
         try {
           this.agent.followup(message)
@@ -425,6 +435,15 @@ export class AcpSession {
     } finally {
       requestSignal?.removeEventListener('abort', onRequestAbort)
     }
+  }
+
+  /**
+   * Resolve one conversation-rewind target to this session's durable message id.
+   * @param messageId - durable user-message id, or the client prompt id naming it.
+   * @returns the durable user-message id; the input when this session never admitted it.
+   */
+  resolveUserMessageId(messageId: string): string {
+    return this.promptMessageIds.get(messageId) ?? messageId
   }
 
   /**
