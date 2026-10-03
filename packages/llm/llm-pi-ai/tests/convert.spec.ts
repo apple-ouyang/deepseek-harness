@@ -951,6 +951,13 @@ describe('mapStopReason / mapUsage', () => {
     'OpenAI Responses stream ended before a terminal response event',
     'openrouter stream ended without a terminal event',
     'Stream ended without finish_reason',
+    // A gateway's mid-response upstream cut, surfaced without an HTTP status.
+    'Upstream response stream was interrupted',
+    'upstream stream was interrupted',
+    // Node's HTTP client wording for a response body cut short.
+    'unexpected EOF',
+    // Go's wording for a corrupted TLS record.
+    'remote error: tls: bad record MAC',
   ])('maps pi-ai transport wording %j', (errorMessage) => {
     expect(mapStopReason(assistant({ stopReason: 'error', errorMessage })))
       .toMatchObject({ kind: 'error', failure: { code: 'TRANSPORT' } })

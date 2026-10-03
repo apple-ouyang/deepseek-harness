@@ -56,6 +56,15 @@ function classifyPiAiError(message: string): string {
   // finish_reason`). The connection dropped mid-response, so this is a transport
   // truncation, not a model-level error.
   if (/stream ended (?:before|without)\b/i.test(message)) return 'TRANSPORT'
+  // A gateway in front of the provider can report a mid-response upstream cut as
+  // plain prose with no HTTP status prefix at all (for example Sub2API's
+  // `Upstream response stream was interrupted`). The connection still dropped
+  // mid-response, so it is the same transport truncation as the wordings above.
+  if (/upstream (?:response )?stream was interrupted/i.test(message)) return 'TRANSPORT'
+  // Node's HTTP client reports a response body cut short as `unexpected EOF`.
+  if (/\bunexpected EOF\b/i.test(message)) return 'TRANSPORT'
+  // A corrupted TLS record (Go renders it as `remote error: tls: bad record MAC`).
+  if (/\bbad record MAC\b|remote error:\s*tls:/i.test(message)) return 'TRANSPORT'
   if (/\b(?:network|connection|socket|fetch)\b|\bECONN[A-Z]+\b/i.test(message)
     || /\b(?:other side closed|HTTP2 request did not get a response|WebSocket closed unexpectedly)\b/i.test(message)
     // undici renders a mid-stream socket drop as a bare `terminated` (its
